@@ -73,3 +73,12 @@ Opt-in via `config["checkpoint_enabled"] = True` or `--checkpoint`. **Per-ticker
 
 - All file I/O passes explicit `encoding="utf-8"` — Windows defaults to cp1252 and silently corrupts non-ASCII content otherwise. Match that pattern in any new I/O.
 - Cache, log, and memory directories all live under `~/.tradingagents/` so the Docker image's non-root user can write to them.
+
+## Subagents (Claude Code)
+
+Project-scoped subagents live in [.claude/agents/](.claude/agents/) and are invoked via the `Agent` tool. Use them to keep large read-only audits out of the main session's context window.
+
+- **`docs-sync`** — read-only auditor that verifies every concrete claim in this file (paths, line numbers, function names, format strings, conventions) against the current code and reports drift. **Invoke before** merging any PR that touches a file mentioned here, **after** any rename or signature change to a function named here, or when starting a session that will make architectural changes. It does not edit this file — it produces a drift report; the main session decides what to update.
+- **`news-pipeline-tester`** — read-only diagnostic for the Group A news pipeline (`tradingagents/dataflows/news_dedup.py` + `source_rank.py`). Given a fixture, it runs `cluster_articles` and explains the cluster assignments, exemplar choices, and rejected articles with concrete Jaccard scores and `(rank, recency)` tuples. **Invoke when** tuning `DEFAULT_JACCARD_THRESHOLD`, expanding `SOURCE_RANK`, debugging "why did this article win/lose" reports, or sanity-checking a behaviour change before opening a PR.
+
+More subagents land alongside their respective code groups: a state tracer (Group C), data-vendor auditor (Group B), memory-log validator (Group B1), provider smoke (when schemas change), and backtest grid runner (Group D).
