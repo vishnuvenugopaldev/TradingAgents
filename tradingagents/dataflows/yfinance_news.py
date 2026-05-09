@@ -4,6 +4,7 @@ import yfinance as yf
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
+from .news_dedup import cluster_articles
 from .stockstats_utils import yf_retry
 
 
@@ -48,6 +49,32 @@ def _extract_article_data(article: dict) -> dict:
         }
 
 
+def _within_window(pub_date, start_dt: datetime, end_dt: datetime) -> bool:
+    """Strict point-in-time guard.
+
+    Articles without a parseable ``pub_date`` are rejected — under the prior
+    behaviour they leaked past the as-of cutoff, contaminating backtests
+    with retroactively indexed coverage.
+    """
+    if pub_date is None:
+        return False
+    naive = pub_date.replace(tzinfo=None) if hasattr(pub_date, "tzinfo") else pub_date
+    return start_dt <= naive <= end_dt
+
+
+def _format_articles(articles: list[dict]) -> str:
+    """Render the cluster-exemplar articles to the markdown shape the LLM consumes."""
+    parts: list[str] = []
+    for data in articles:
+        parts.append(f"### {data['title']} (source: {data['publisher']})")
+        if data.get("summary"):
+            parts.append(data["summary"])
+        if data.get("link"):
+            parts.append(f"Link: {data['link']}")
+        parts.append("")  # blank line between articles
+    return "\n".join(parts)
+
+
 def get_news_yfinance(
     ticker: str,
     start_date: str,
@@ -71,34 +98,21 @@ def get_news_yfinance(
         if not news:
             return f"No news found for {ticker}"
 
-        # Parse date range for filtering
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        # End-of-day on end_date is the strict upper bound. Articles with no
+        # pub_date are dropped by _within_window, not granted slack.
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d") + relativedelta(hours=23, minutes=59, seconds=59)
 
-        news_str = ""
-        filtered_count = 0
+        in_window = [
+            data for data in (_extract_article_data(a) for a in news)
+            if _within_window(data["pub_date"], start_dt, end_dt)
+        ]
 
-        for article in news:
-            data = _extract_article_data(article)
-
-            # Filter by date if publish time is available
-            if data["pub_date"]:
-                pub_date_naive = data["pub_date"].replace(tzinfo=None)
-                if not (start_dt <= pub_date_naive <= end_dt + relativedelta(days=1)):
-                    continue
-
-            news_str += f"### {data['title']} (source: {data['publisher']})\n"
-            if data["summary"]:
-                news_str += f"{data['summary']}\n"
-            if data["link"]:
-                news_str += f"Link: {data['link']}\n"
-            news_str += "\n"
-            filtered_count += 1
-
-        if filtered_count == 0:
+        clustered = cluster_articles(in_window)
+        if not clustered:
             return f"No news found for {ticker} between {start_date} and {end_date}"
 
-        return f"## {ticker} News, from {start_date} to {end_date}:\n\n{news_str}"
+        return f"## {ticker} News, from {start_date} to {end_date}:\n\n{_format_articles(clustered)}"
 
     except Exception as e:
         return f"Error fetching news for {ticker}: {str(e)}"
@@ -128,70 +142,40 @@ def get_global_news_yfinance(
         "global markets trading",
     ]
 
-    all_news = []
-    seen_titles = set()
+    curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+    end_dt = curr_dt + relativedelta(hours=23, minutes=59, seconds=59)
+    start_dt = curr_dt - relativedelta(days=look_back_days)
+    start_date = start_dt.strftime("%Y-%m-%d")
+
+    collected: list[dict] = []
 
     try:
+        # Pull more aggressively than ``limit`` because clustering will collapse
+        # syndicated copies of the same wire — without overshoot the final list
+        # is too short.
+        per_query = max(limit * 2, 20)
         for query in search_queries:
             search = yf_retry(lambda q=query: yf.Search(
                 query=q,
-                news_count=limit,
+                news_count=per_query,
                 enable_fuzzy_query=True,
             ))
+            if not search.news:
+                continue
+            for article in search.news:
+                data = _extract_article_data(article)
+                if not _within_window(data["pub_date"], start_dt, end_dt):
+                    continue
+                collected.append(data)
 
-            if search.news:
-                for article in search.news:
-                    # Handle both flat and nested structures
-                    if "content" in article:
-                        data = _extract_article_data(article)
-                        title = data["title"]
-                    else:
-                        title = article.get("title", "")
-
-                    # Deduplicate by title
-                    if title and title not in seen_titles:
-                        seen_titles.add(title)
-                        all_news.append(article)
-
-            if len(all_news) >= limit:
-                break
-
-        if not all_news:
+        if not collected:
             return f"No global news found for {curr_date}"
 
-        # Calculate date range
-        curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
-        start_dt = curr_dt - relativedelta(days=look_back_days)
-        start_date = start_dt.strftime("%Y-%m-%d")
+        clustered = cluster_articles(collected)[:limit]
+        if not clustered:
+            return f"No global news found for {curr_date}"
 
-        news_str = ""
-        for article in all_news[:limit]:
-            # Handle both flat and nested structures
-            if "content" in article:
-                data = _extract_article_data(article)
-                # Skip articles published after curr_date (look-ahead guard)
-                if data.get("pub_date"):
-                    pub_naive = data["pub_date"].replace(tzinfo=None) if hasattr(data["pub_date"], "replace") else data["pub_date"]
-                    if pub_naive > curr_dt + relativedelta(days=1):
-                        continue
-                title = data["title"]
-                publisher = data["publisher"]
-                link = data["link"]
-                summary = data["summary"]
-            else:
-                title = article.get("title", "No title")
-                publisher = article.get("publisher", "Unknown")
-                link = article.get("link", "")
-                summary = ""
-
-            news_str += f"### {title} (source: {publisher})\n"
-            if summary:
-                news_str += f"{summary}\n"
-            if link:
-                news_str += f"Link: {link}\n"
-            news_str += "\n"
-
-        return f"## Global Market News, from {start_date} to {curr_date}:\n\n{news_str}"
+        return f"## Global Market News, from {start_date} to {curr_date}:\n\n{_format_articles(clustered)}"
 
     except Exception as e:
         return f"Error fetching global news: {str(e)}"
