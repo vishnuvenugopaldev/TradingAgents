@@ -191,15 +191,21 @@ class TradingAgentsGraph:
     def _fetch_returns(
         self, ticker: str, trade_date: str, holding_days: int = 5
     ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
-        """Fetch raw and alpha return for ticker over holding_days from trade_date.
+        """Fetch raw and excess (vs SPY) return for ticker over holding_days from trade_date.
 
-        Returns (raw_return, alpha_return, actual_holding_days) or
+        Returns (raw_return, excess_return_vs_spy, actual_holding_days) or
         (None, None, None) if price data is unavailable (too recent, delisted,
         or network error).
+
+        ``excess_return_vs_spy = raw - SPY_return`` over the same window. This
+        is excess return, not alpha — there is no beta adjustment, no factor
+        model, no risk discount. The label "alpha" was retired in Group B.
         """
         try:
             start = datetime.strptime(trade_date, "%Y-%m-%d")
-            end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
+            # Calendar-day buffer covers weekends, holidays, and a generous
+            # margin so we always have enough bars for ``holding_days``.
+            end = start + timedelta(days=holding_days * 2 + 10)
             end_str = end.strftime("%Y-%m-%d")
 
             stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
@@ -217,8 +223,8 @@ class TradingAgentsGraph:
                 (spy["Close"].iloc[actual_days] - spy["Close"].iloc[0])
                 / spy["Close"].iloc[0]
             )
-            alpha = raw - spy_ret
-            return raw, alpha, actual_days
+            excess_return_vs_spy = raw - spy_ret
+            return raw, excess_return_vs_spy, actual_days
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s (will retry next run): %s",
@@ -229,33 +235,43 @@ class TradingAgentsGraph:
     def _resolve_pending_entries(self, ticker: str) -> None:
         """Resolve pending log entries for ticker at the start of a new run.
 
-        Fetches returns for each same-ticker pending entry, generates reflections,
-        then writes all updates in a single atomic batch write to avoid redundant I/O.
-        Skips entries whose price data is not yet available (too recent or delisted).
+        Fetches returns for each same-ticker pending entry over its
+        horizon-matched window (Group B2), generates a reflection, then
+        writes all updates in a single atomic batch write to avoid redundant
+        I/O. Skips entries whose price data is not yet available (too recent
+        or delisted).
 
-        Trade-off: only same-ticker entries are resolved per run.  Entries for
-        other tickers accumulate until that ticker is run again.
+        Trade-off: only same-ticker entries are resolved per run. The
+        ``tradingagents resolve-pendings`` CLI subcommand (Group B3) walks
+        every pending across every ticker.
         """
+        from tradingagents.agents.utils.horizon import (
+            extract_time_horizon,
+            parse_horizon_to_days,
+        )
+
         pending = [e for e in self.memory_log.get_pending_entries() if e["ticker"] == ticker]
         if not pending:
             return
 
         updates = []
         for entry in pending:
-            raw, alpha, days = self._fetch_returns(ticker, entry["date"])
+            horizon_str = extract_time_horizon(entry.get("decision", ""))
+            holding_days = parse_horizon_to_days(horizon_str)
+            raw, excess, actual_days = self._fetch_returns(ticker, entry["date"], holding_days)
             if raw is None:
                 continue  # price not available yet — try again next run
             reflection = self.reflector.reflect_on_final_decision(
                 final_decision=entry.get("decision", ""),
                 raw_return=raw,
-                alpha_return=alpha,
+                excess_return=excess,
             )
             updates.append({
                 "ticker": ticker,
                 "trade_date": entry["date"],
                 "raw_return": raw,
-                "alpha_return": alpha,
-                "holding_days": days,
+                "excess_return": excess,
+                "holding_days": actual_days,
                 "reflection": reflection,
             })
 

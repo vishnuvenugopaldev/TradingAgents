@@ -1217,5 +1217,94 @@ def analyze(
     run_analysis(checkpoint=checkpoint)
 
 
+@app.command(name="resolve-pendings")
+def resolve_pendings(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would be resolved without writing to the log or calling the LLM.",
+    ),
+):
+    """Walk every pending entry across every ticker and resolve what we can.
+
+    Group B3: the per-run resolver only handles the current ticker. Run this
+    subcommand to back-fill outcomes for tickers you haven't re-analyzed,
+    using each entry's stored ``Time Horizon`` as the holding window.
+    """
+    import yfinance as yf  # noqa: F401  — import lazily so plain `--help` is fast
+
+    from tradingagents.agents.utils.horizon import (
+        extract_time_horizon,
+        parse_horizon_to_days,
+    )
+    from tradingagents.agents.utils.memory import TradingMemoryLog
+    from tradingagents.graph.reflection import Reflector
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+    from tradingagents.llm_clients import create_llm_client
+
+    config = DEFAULT_CONFIG.copy()
+    log = TradingMemoryLog(config)
+    pendings = log.get_pending_entries()
+
+    if not pendings:
+        console.print("[green]No pending entries to resolve.[/green]")
+        return
+
+    console.print(
+        f"[cyan]Found {len(pendings)} pending entr"
+        f"{'y' if len(pendings) == 1 else 'ies'} across "
+        f"{len({e['ticker'] for e in pendings})} ticker(s).[/cyan]"
+    )
+
+    if dry_run:
+        for entry in pendings:
+            horizon_str = extract_time_horizon(entry.get("decision", "")) or "(none)"
+            holding = parse_horizon_to_days(horizon_str)
+            console.print(
+                f"  • {entry['ticker']} {entry['date']}  "
+                f"horizon={horizon_str!r}  → {holding} trading days"
+            )
+        console.print("[yellow]Dry run only — nothing written.[/yellow]")
+        return
+
+    # Build a Reflector with the configured provider's LLM. We construct it
+    # ad-hoc instead of standing up a full TradingAgentsGraph — we don't need
+    # the rest of the pipeline.
+    deep_client = create_llm_client(
+        provider=config["llm_provider"],
+        model=config["quick_think_llm"],
+        base_url=config.get("backend_url"),
+    )
+    reflector = Reflector(deep_client.get_llm())
+
+    # Bind a free-function fetcher to TradingAgentsGraph._fetch_returns so we
+    # don't take a graph dependency. The method only uses ``self`` for logging
+    # — _fetch_returns is otherwise pure — so a SimpleNamespace stand-in works.
+    from types import SimpleNamespace
+    fake_self = SimpleNamespace()
+
+    def fetch(ticker: str, trade_date: str, holding_days: int):
+        return TradingAgentsGraph._fetch_returns(
+            fake_self, ticker, trade_date, holding_days
+        )
+
+    def reflect(decision_text: str, raw: float, excess: float):
+        return reflector.reflect_on_final_decision(
+            final_decision=decision_text, raw_return=raw, excess_return=excess,
+        )
+
+    def horizon_for(entry: dict) -> int:
+        horizon_str = extract_time_horizon(entry.get("decision", ""))
+        return parse_horizon_to_days(horizon_str)
+
+    result = log.resolve_all_pendings(fetch, reflect, horizon_for=horizon_for)
+    console.print(
+        f"[green]Resolved {result['resolved']} entr"
+        f"{'y' if result['resolved'] == 1 else 'ies'}.[/green]  "
+        f"[yellow]{result['skipped']} skipped[/yellow] (price data not yet "
+        "available — they will be retried on the next run)."
+    )
+
+
 if __name__ == "__main__":
     app()

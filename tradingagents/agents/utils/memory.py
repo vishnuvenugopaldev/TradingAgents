@@ -1,6 +1,34 @@
-"""Append-only markdown decision log for TradingAgents."""
+"""Append-only markdown decision log for TradingAgents.
 
-from typing import List, Optional
+Tag format
+----------
+
+Pending entries:
+    [YYYY-MM-DD | TICKER | Rating | pending]
+
+Resolved entries (current shape — Group B):
+    [YYYY-MM-DD | TICKER | Rating | +N.N% raw | +N.N% vs SPY | Nd]
+
+Resolved entries (legacy shape, still parsed):
+    [YYYY-MM-DD | TICKER | Rating | +N.N% | +N.N% | Nd]
+
+The legacy shape was written before Group B made the benchmark explicit. The
+parser strips trailing ``raw`` / ``vs SPY`` annotations on read so existing
+logs continue to load without a migration script. New writes use the
+annotated shape.
+
+Returns terminology
+-------------------
+
+The framework computes ``excess_return = raw - SPY_return`` over the holding
+window. That is **excess return**, not alpha — there is no beta adjustment,
+no factor model, no risk discount. Earlier code (and earlier log entries)
+called the field "alpha"; that label was misleading and has been retired
+internally. The parser still exposes ``entry["alpha"]`` as a backwards-compat
+alias on the dict it returns; new code should read ``entry["excess"]``.
+"""
+
+from typing import Callable, Dict, List, Optional
 from pathlib import Path
 import re
 
@@ -15,6 +43,10 @@ class TradingMemoryLog:
     # Precompiled patterns — avoids re-compilation on every load_entries() call
     _DECISION_RE = re.compile(r"DECISION:\n(.*?)(?=\nREFLECTION:|\Z)", re.DOTALL)
     _REFLECTION_RE = re.compile(r"REFLECTION:\n(.*?)$", re.DOTALL)
+
+    # Strip trailing annotations on read so old (`+2.3%`) and new
+    # (`+2.3% raw`, `+2.3% vs SPY`) tag formats produce identical parsed dicts.
+    _ANNOT_SUFFIX_RE = re.compile(r"\s+(raw|vs\s+spy)\s*$", re.IGNORECASE)
 
     def __init__(self, config: dict = None):
         cfg = config or {}
@@ -97,12 +129,27 @@ class TradingMemoryLog:
 
     # --- Update path (Phase B) ---
 
+    @staticmethod
+    def _format_resolved_tag(
+        trade_date: str,
+        ticker: str,
+        rating: str,
+        raw_return: float,
+        excess_return: float,
+        holding_days: int,
+    ) -> str:
+        """Produce a resolved tag line in the annotated Group B shape."""
+        return (
+            f"[{trade_date} | {ticker} | {rating}"
+            f" | {raw_return:+.1%} raw | {excess_return:+.1%} vs SPY | {holding_days}d]"
+        )
+
     def update_with_outcome(
         self,
         ticker: str,
         trade_date: str,
         raw_return: float,
-        alpha_return: float,
+        excess_return: float,
         holding_days: int,
         reflection: str,
     ) -> None:
@@ -119,8 +166,6 @@ class TradingMemoryLog:
         blocks = text.split(self._SEPARATOR)
 
         pending_prefix = f"[{trade_date} | {ticker} |"
-        raw_pct = f"{raw_return:+.1%}"
-        alpha_pct = f"{alpha_return:+.1%}"
 
         updated = False
         new_blocks = []
@@ -141,9 +186,8 @@ class TradingMemoryLog:
                 # Parse rating from the existing pending tag
                 fields = [f.strip() for f in tag_line[1:-1].split("|")]
                 rating = fields[2]
-                new_tag = (
-                    f"[{trade_date} | {ticker} | {rating}"
-                    f" | {raw_pct} | {alpha_pct} | {holding_days}d]"
+                new_tag = self._format_resolved_tag(
+                    trade_date, ticker, rating, raw_return, excess_return, holding_days,
                 )
                 rest = "\n".join(lines[1:])
                 new_blocks.append(
@@ -165,8 +209,8 @@ class TradingMemoryLog:
     def batch_update_with_outcomes(self, updates: List[dict]) -> None:
         """Apply multiple outcome updates in a single read + atomic write.
 
-        Each element of updates must have keys: ticker, trade_date,
-        raw_return, alpha_return, holding_days, reflection.
+        Each element of ``updates`` must have keys: ``ticker``, ``trade_date``,
+        ``raw_return``, ``excess_return``, ``holding_days``, ``reflection``.
         """
         if not self._log_path or not self._log_path.exists() or not updates:
             return
@@ -193,11 +237,9 @@ class TradingMemoryLog:
                 if tag_line.startswith(pending_prefix) and tag_line.endswith("| pending]"):
                     fields = [f.strip() for f in tag_line[1:-1].split("|")]
                     rating = fields[2]
-                    raw_pct = f"{upd['raw_return']:+.1%}"
-                    alpha_pct = f"{upd['alpha_return']:+.1%}"
-                    new_tag = (
-                        f"[{trade_date} | {ticker} | {rating}"
-                        f" | {raw_pct} | {alpha_pct} | {upd['holding_days']}d]"
+                    new_tag = self._format_resolved_tag(
+                        trade_date, ticker, rating,
+                        upd["raw_return"], upd["excess_return"], upd["holding_days"],
                     )
                     rest = "\n".join(lines[1:])
                     new_blocks.append(
@@ -215,6 +257,68 @@ class TradingMemoryLog:
         tmp_path = self._log_path.with_suffix(".tmp")
         tmp_path.write_text(new_text, encoding="utf-8")
         tmp_path.replace(self._log_path)
+
+    def resolve_all_pendings(
+        self,
+        fetch_outcome: Callable[[str, str, int], tuple],
+        reflect: Callable[[str, float, float], str],
+        horizon_for: Callable[[dict], int] = None,
+    ) -> Dict[str, int]:
+        """Walk every pending entry across all tickers and resolve what we can.
+
+        Group B3: the existing per-run resolver in ``TradingAgentsGraph`` only
+        handles the current ticker, leaving cross-ticker pendings stranded.
+        This method is the back-fill: one pass over the log, one batch write.
+
+        Args:
+            fetch_outcome: ``(ticker, trade_date, holding_days) -> (raw, excess, days)``
+                or ``(None, None, None)`` when prices aren't yet available.
+            reflect: ``(decision_text, raw, excess) -> reflection_str``.
+            horizon_for: optional ``entry -> int`` mapper that picks the
+                holding-day window from the stored decision text. Defaults to
+                always returning 5 days, preserving prior behaviour.
+
+        Returns:
+            ``{"resolved": N, "skipped": M}`` so callers can report progress.
+            "skipped" covers entries where price data isn't yet available
+            (too recent, delisted, network blip) — they stay pending and will
+            be retried on the next call.
+        """
+        if not self._log_path or not self._log_path.exists():
+            return {"resolved": 0, "skipped": 0}
+
+        pendings = self.get_pending_entries()
+        if not pendings:
+            return {"resolved": 0, "skipped": 0}
+
+        if horizon_for is None:
+            horizon_for = lambda _entry: 5  # noqa: E731
+
+        updates = []
+        skipped = 0
+        for entry in pendings:
+            try:
+                holding = horizon_for(entry)
+            except Exception:
+                holding = 5
+            raw, excess, actual_days = fetch_outcome(entry["ticker"], entry["date"], holding)
+            if raw is None:
+                skipped += 1
+                continue
+            reflection = reflect(entry.get("decision", ""), raw, excess)
+            updates.append({
+                "ticker": entry["ticker"],
+                "trade_date": entry["date"],
+                "raw_return": raw,
+                "excess_return": excess,
+                "holding_days": actual_days,
+                "reflection": reflection,
+            })
+
+        if updates:
+            self.batch_update_with_outcomes(updates)
+
+        return {"resolved": len(updates), "skipped": skipped}
 
     # --- Helpers ---
 
@@ -255,6 +359,13 @@ class TradingMemoryLog:
             kept.append(block)
         return kept
 
+    @classmethod
+    def _strip_annotation(cls, value: Optional[str]) -> Optional[str]:
+        """Strip ``raw`` / ``vs SPY`` annotation suffixes added by Group B writes."""
+        if value is None:
+            return None
+        return cls._ANNOT_SUFFIX_RE.sub("", value).strip() or None
+
     def _parse_entry(self, raw: str) -> Optional[dict]:
         lines = raw.strip().splitlines()
         if not lines:
@@ -265,13 +376,19 @@ class TradingMemoryLog:
         fields = [f.strip() for f in tag_line[1:-1].split("|")]
         if len(fields) < 4:
             return None
+        is_pending = fields[3] == "pending"
+        raw_field = self._strip_annotation(fields[3]) if not is_pending else None
+        excess_field = self._strip_annotation(fields[4]) if len(fields) > 4 else None
         entry = {
             "date": fields[0],
             "ticker": fields[1],
             "rating": fields[2],
-            "pending": fields[3] == "pending",
-            "raw": fields[3] if fields[3] != "pending" else None,
-            "alpha": fields[4] if len(fields) > 4 else None,
+            "pending": is_pending,
+            "raw": raw_field,
+            "excess": excess_field,
+            # Backwards-compat alias for existing call sites that still read
+            # ``entry["alpha"]``. New code should prefer ``entry["excess"]``.
+            "alpha": excess_field,
             "holding": fields[5] if len(fields) > 5 else None,
         }
         body = "\n".join(lines[1:]).strip()
@@ -283,16 +400,26 @@ class TradingMemoryLog:
 
     def _format_full(self, e: dict) -> str:
         raw = e["raw"] or "n/a"
-        alpha = e["alpha"] or "n/a"
+        excess = e.get("excess") or e.get("alpha") or "n/a"
         holding = e["holding"] or "n/a"
-        tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {raw} | {alpha} | {holding}]"
+        # When the parsed entry came from a current-format write we already
+        # round-tripped the strict annotated form. Re-render using the same
+        # annotations so injected past context shows the benchmark explicitly.
+        if raw != "n/a" and " raw" not in raw:
+            raw = f"{raw} raw"
+        if excess != "n/a" and "vs SPY" not in excess:
+            excess = f"{excess} vs SPY"
+        tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {raw} | {excess} | {holding}]"
         parts = [tag, f"DECISION:\n{e['decision']}"]
         if e["reflection"]:
             parts.append(f"REFLECTION:\n{e['reflection']}")
         return "\n\n".join(parts)
 
     def _format_reflection_only(self, e: dict) -> str:
-        tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {e['raw'] or 'n/a'}]"
+        raw_display = e["raw"] or "n/a"
+        if raw_display != "n/a" and " raw" not in raw_display:
+            raw_display = f"{raw_display} raw"
+        tag = f"[{e['date']} | {e['ticker']} | {e['rating']} | {raw_display}]"
         if e["reflection"]:
             return f"{tag}\n{e['reflection']}"
         text = e["decision"][:300]

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Install (editable):** `pip install -e .` — registers the `tradingagents` console script defined in `pyproject.toml`.
 
-**Run the CLI:** `tradingagents` (or `python -m cli.main`). Subcommand: `tradingagents analyze` with optional `--checkpoint` and `--clear-checkpoints` flags. The plain `tradingagents` entry walks the user through ticker, date, provider, and analyst selection interactively.
+**Run the CLI:** `tradingagents` (or `python -m cli.main`). Subcommands: `tradingagents analyze` (with optional `--checkpoint` and `--clear-checkpoints` flags) and `tradingagents resolve-pendings` (with optional `--dry-run`). The plain `tradingagents` entry walks the user through ticker, date, provider, and analyst selection interactively. `resolve-pendings` walks every pending entry across every ticker in the memory log and back-fills outcomes (Group B3) — the per-run resolver only handles the current ticker.
 
 **Run a single propagation from Python:** edit and run `python main.py` (single-ticker example with `TradingAgentsGraph(...).propagate("NVDA", "YYYY-MM-DD")`).
 
@@ -42,9 +42,16 @@ The graph itself is wired in `GraphSetup.setup_graph` (`tradingagents/graph/setu
 Path: `~/.tradingagents/memory/trading_memory.md` (override with `TRADINGAGENTS_MEMORY_LOG_PATH`). Append-only markdown. **Entries are separated by the literal string `\n\n<!-- ENTRY_END -->\n\n`** — chosen because LLMs cannot emit HTML comments, making it a safe hard delimiter. Tag-line format is one of:
 
 - pending: `[YYYY-MM-DD | TICKER | Rating | pending]`
-- resolved: `[YYYY-MM-DD | TICKER | Rating | +N.N% | +N.N% | Nd]` (raw, alpha-vs-SPY, holding days)
+- resolved (current, Group B): `[YYYY-MM-DD | TICKER | Rating | +N.N% raw | +N.N% vs SPY | Nd]`
+- resolved (legacy, still parsed): `[YYYY-MM-DD | TICKER | Rating | +N.N% | +N.N% | Nd]`
 
-Updates use a temp-file + `os.replace()` atomic write — never write to the log file in place. Reflection on a decision is **deferred**: the same-ticker next run fetches realised return + alpha and writes a 2-4 sentence reflection. Cross-ticker pendings only resolve when *that* ticker is run again. `_fetch_returns` in `tradingagents/graph/trading_graph.py` hardcodes a **5 trading-day** window and computes `alpha = raw - spy_ret` (excess return, not true alpha — beta-unadjusted). The PM's `time_horizon` field is not currently consulted by the reflection window.
+The annotation suffixes (`raw`, `vs SPY`) make the benchmark explicit. `_parse_entry` strips them on read so old logs continue to load without a migration script — the parsed dict exposes `entry["raw"]`, `entry["excess"]`, and a backwards-compat alias `entry["alpha"]` (all with the bare `+N.N%` string).
+
+Updates use a temp-file + `os.replace()` atomic write — never write to the log file in place. Reflection on a decision is **deferred**: the same-ticker next run fetches realised return + excess-vs-SPY and writes a 2–4 sentence reflection. Cross-ticker pendings are resolved by `tradingagents resolve-pendings` (Group B3) — the per-run resolver only handles the current ticker.
+
+**Returns terminology.** `_fetch_returns` in `tradingagents/graph/trading_graph.py` returns `(raw_return, excess_return_vs_spy, holding_days)`. `excess_return_vs_spy = raw - spy_return` over the same window — that is excess return, **not alpha** (no beta adjustment, no factor model). The earlier label "alpha" was retired in Group B; new code should never reintroduce it.
+
+**Horizon-matched reflection window (Group B2).** The Portfolio Manager emits a `time_horizon` field on `PortfolioDecision` (e.g. `"3-6 months"`). `_resolve_pending_entries` reads that field via `extract_time_horizon`, maps it to trading days via `parse_horizon_to_days` in `tradingagents/agents/utils/horizon.py`, and passes the result to `_fetch_returns`. Range expressions resolve to the midpoint (e.g. `"3-6 months"` → ~95 trading days). Missing or unparseable horizons fall back to the framework's prior 5-day default.
 
 ### Path-traversal guard
 

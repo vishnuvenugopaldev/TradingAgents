@@ -138,10 +138,10 @@ class TestTradingMemoryLogCore:
 
         updates = [
             {"ticker": "NVDA", "trade_date": "2026-01-05",
-             "raw_return": 0.05, "alpha_return": 0.02, "holding_days": 5,
+             "raw_return": 0.05, "excess_return": 0.02, "holding_days": 5,
              "reflection": "First correct."},
             {"ticker": "NVDA", "trade_date": "2026-01-12",
-             "raw_return": -0.03, "alpha_return": -0.01, "holding_days": 5,
+             "raw_return": -0.03, "excess_return": -0.01, "holding_days": 5,
              "reflection": "Second correct."},
         ]
         log.batch_update_with_outcomes(updates)
@@ -451,11 +451,14 @@ class TestDeferredReflection:
         assert e["pending"] is False
         assert e["decision"] == DECISION_BUY.strip()
         assert e["reflection"] == "Momentum confirmed."
+        # Annotation suffixes (`raw`, `vs SPY`) are stripped by the parser so
+        # entry["raw"]/entry["alpha"] keep the bare percentage strings.
         assert e["raw"] == "+4.2%"
         assert e["alpha"] == "+2.1%"
+        assert e["excess"] == "+2.1%"
         assert e["holding"] == "5d"
         raw_text = (tmp_path / "trading_memory.md").read_text(encoding="utf-8")
-        assert "[2026-01-10 | NVDA | Buy | +4.2% | +2.1% | 5d]\n\nDECISION:" in raw_text
+        assert "[2026-01-10 | NVDA | Buy | +4.2% raw | +2.1% vs SPY | 5d]\n\nDECISION:" in raw_text
 
     # Reflector.reflect_on_final_decision
 
@@ -464,7 +467,7 @@ class TestDeferredReflection:
         mock_llm.invoke.return_value.content = "Directionally correct. Thesis confirmed."
         reflector = Reflector(mock_llm)
         result = reflector.reflect_on_final_decision(
-            final_decision=DECISION_BUY, raw_return=0.042, alpha_return=0.021
+            final_decision=DECISION_BUY, raw_return=0.042, excess_return=0.021
         )
         assert result == "Directionally correct. Thesis confirmed."
         mock_llm.invoke.assert_called_once()
@@ -475,13 +478,16 @@ class TestDeferredReflection:
         mock_llm.invoke.return_value.content = "Incorrect call."
         reflector = Reflector(mock_llm)
         reflector.reflect_on_final_decision(
-            final_decision=DECISION_SELL, raw_return=-0.08, alpha_return=-0.05
+            final_decision=DECISION_SELL, raw_return=-0.08, excess_return=-0.05
         )
         messages = mock_llm.invoke.call_args[0][0]
         human_content = next(content for role, content in messages if role == "human")
         assert "-8.0%" in human_content
         assert "-5.0%" in human_content
         assert "Exit position immediately." in human_content
+        # B1: excess-return language replaces the misnomer "alpha".
+        assert "Excess return vs SPY" in human_content
+        assert "Alpha vs SPY" not in human_content
 
     # TradingAgentsGraph._fetch_returns
 
